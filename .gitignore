@@ -1,0 +1,6 @@
+instruments.json
+instruments.json.gz
+/tmp/
+__pycache__/
+*.pyc
+.DS_Store
