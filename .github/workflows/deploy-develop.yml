@@ -3,9 +3,9 @@ name: Deploy Tickers (Develop)
 on:
   push:
     branches: [develop]
+  workflow_dispatch:
 
 env:
-  PYTHON_VERSION: '3.11'
   DEPLOY_ENV: dev
   CLOUDFRONT_DIST_ID: E3202GZ5910KGI
   S3_BUCKET: data-atlas-dashboard
@@ -15,121 +15,86 @@ jobs:
   refresh-and-deploy:
     name: Transform, Validate, Deploy
     runs-on: ubuntu-latest
-    
+
     permissions:
       contents: read
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          submodules: recursive
-      
-      # Clone upstream free-ticker-database repo
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
       - name: Clone free-ticker-database
         run: |
           git clone --depth 1 \
             https://github.com/adanos-software/free-ticker-database.git \
             /tmp/ticker-source
-          echo "✓ Cloned free-ticker-database"
-      
-      # Set up Python
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
-      
-      # Install dependencies
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install pyarrow pandas requests
-          echo "✓ Dependencies installed"
-      
-      # Rebuild the database
+
       - name: Rebuild ticker database
-        run: |
-          cd /tmp/ticker-source
-          python3 scripts/rebuild_dataset.py
-          echo "✓ Database rebuilt"
-      
-      # Transform: SQLite → JSON
+        working-directory: /tmp/ticker-source
+        run: python3 scripts/rebuild_dataset.py
+
       - name: Transform tickers
         run: |
           python3 scripts/transform_tickers.py \
             --input /tmp/ticker-source/data/tickers.db \
             --output instruments.json
-      
-      # Validate
+
       - name: Validate data quality
-        run: |
-          python3 scripts/validate.py --input instruments.json
-      
-      # Save validation report to S3 (for audit trail)
-      - name: Upload validation report to S3
-        if: always()
+        run: python3 scripts/validate.py --input instruments.json
+
+      - name: Configure AWS credentials
+        if: success()
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-southeast-2
-      
-      - name: Save validation report
-        if: always()
-        run: |
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H%M%SZ")
-          aws s3 cp instruments.json \
-            s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/validation_${TIMESTAMP}.json \
-            --content-type application/json
-      
-      # Upload tickers to S3 (only if validation passed)
+
       - name: Upload tickers to S3
-        if: success()
         run: |
           aws s3 cp instruments.json.gz \
             s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.json.gz \
             --content-type application/json \
             --content-encoding gzip \
             --cache-control "max-age=604800"
-          echo "✓ Uploaded to s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.json.gz"
-      
-      # Invalidate CloudFront cache
+
+      - name: Upload dated snapshot
+        run: |
+          STAMP=$(date -u +"%Y-%m-%d")
+          aws s3 cp instruments.json.gz \
+            s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest-${STAMP}.json.gz \
+            --content-type application/json \
+            --content-encoding gzip
+
       - name: Invalidate CloudFront cache
-        if: success()
         run: |
           aws cloudfront create-invalidation \
             --distribution-id ${{ env.CLOUDFRONT_DIST_ID }} \
-            --paths "/instruments/dev/*"
-          echo "✓ CloudFront cache invalidated"
-      
-      # Commit updated artifacts to repo (optional audit trail)
-      - name: Commit artifacts
-        if: success()
-        run: |
-          git config user.name "atlas-bot"
-          git config user.email "bot@atlas-dashboard.com"
-          git add instruments.json
-          git diff --quiet && git diff --staged --quiet || (
-            git commit -m "chore: update ticker data (develop) - $(date -u +%Y-%m-%d)"
-            git push
-          ) || true
-      
-      # Summary
+            --paths "/${{ env.S3_PREFIX }}/*"
+
       - name: Log summary
         if: always()
         run: |
-          echo ""
           echo "════════════════════════════════════════"
-          echo "Deploy Summary (Develop)"
+          echo "Deploy Summary (${{ env.DEPLOY_ENV }})"
           echo "════════════════════════════════════════"
-          echo "Environment: ${{ env.DEPLOY_ENV }}"
-          echo "S3 Path: s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.json.gz"
-          echo "CloudFront Dist: ${{ env.CLOUDFRONT_DIST_ID }}"
+          echo "S3: s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.json.gz"
           if [ -f instruments.json ]; then
-            COUNT=$(jq '.count' instruments.json)
-            echo "Instruments: $COUNT"
-            ISIN_PCT=$(jq '.isin_coverage_pct' instruments.json)
-            echo "ISIN Coverage: ${ISIN_PCT}%"
+            echo "Instruments:   $(jq -r '.count' instruments.json)"
+            echo "ISIN coverage: $(jq -r '.isin_coverage_pct' instruments.json)%"
+            echo "Exchanges:     $(jq -r '.exchanges | keys | join(", ")' instruments.json)"
+          else
+            echo "No instruments.json produced — transform did not complete."
           fi
           echo "════════════════════════════════════════"
