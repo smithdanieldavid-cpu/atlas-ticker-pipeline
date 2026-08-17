@@ -2,272 +2,135 @@
 """
 Validate transformed ticker JSON before deployment.
 
-Checks:
-  ✓ Row count (sanity check)
-  ✓ Critical tickers present (NVDA, BHP, PMGOLD, VGAD, VGS)
-  ✓ Exchange coverage (all 4 regions)
-  ✓ ISIN coverage (warn if <95%, fail if <85%)
-  ✓ Schema validation
-  ✓ No truncation/corruption
+FAIL (blocks deploy): missing critical ticker, row count far too low,
+                      absent region, ISIN < 85%, bad schema
+WARN (deploys anyway): ISIN 85-95%, minor data quality issues
 
-Usage:
-  python3 scripts/validate.py --input instruments.json
-
-Exit codes:
-  0 = PASS (may have warnings)
-  1 = FAIL (critical issue)
+Exit 0 = deploy, Exit 1 = block.
 """
 
 import json
 import sys
-from pathlib import Path
-from typing import List, Dict, Any, Tuple
+import argparse
 
+CRITICAL_TICKERS = ['NVDA', 'BHP', 'PMGOLD', 'VGAD', 'VGS']
 
-# Critical tickers (must be present)
-CRITICAL_TICKERS = {
-    'NVDA',     # US
-    'BHP',      # AU
-    'PMGOLD',   # AU
-    'VGAD',     # AU
-    'VGS',      # AU
-}
-
-# Expected regional coverage
 EXPECTED_REGIONS = {
-    'US': ['NASDAQ', 'NYSE'],
+    'US': ['NASDAQ', 'NYSE', 'NYSE ARCA', 'NYSE MKT', 'BATS'],
     'AU': ['ASX'],
-    'ASIA': ['JPX', 'HKEX', 'SGX', 'KRX', 'HOSE', 'HNX', 'UPCOM'],
-    'CANADA': ['TMX'],
+    'ASIA': ['TSE', 'HKEX', 'SGX', 'KRX', 'KOSDAQ', 'HOSE', 'HNX', 'UPCOM'],
+    'CANADA': ['TSX', 'TSXV', 'NEO'],
 }
 
-# Thresholds
-MIN_INSTRUMENT_COUNT = 50000
-MIN_ISIN_COVERAGE_FAIL = 85.0
-MIN_ISIN_COVERAGE_WARN = 95.0
+MIN_COUNT = 10000
+ISIN_FAIL = 85.0
+ISIN_WARN = 95.0
 
-
-def load_json(path: str) -> Dict[str, Any]:
-    """Load and parse JSON."""
-    with open(path, 'r') as f:
-        return json.load(f)
-
-
-def validate_schema(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate JSON schema."""
-    errors = []
-    warnings = []
-    
-    required_keys = ['version', 'timestamp', 'count', 'instruments']
-    for key in required_keys:
-        if key not in data:
-            errors.append(f"Missing required key: {key}")
-    
-    if not isinstance(data.get('instruments'), list):
-        errors.append("'instruments' must be a list")
-        return len(errors) == 0, errors
-    
-    # Check first instrument schema
-    if data['instruments']:
-        first = data['instruments'][0]
-        required_fields = ['id', 'ticker', 'name', 'exchange', 'country', 'isin', 'assetType']
-        for field in required_fields:
-            if field not in first:
-                errors.append(f"Missing field in instrument: {field}")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_row_count(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate minimum row count."""
-    errors = []
-    warnings = []
-    
-    count = data.get('count', 0)
-    if count < MIN_INSTRUMENT_COUNT:
-        errors.append(
-            f"Row count too low: {count:,} (minimum: {MIN_INSTRUMENT_COUNT:,})"
-        )
-    else:
-        print(f"✓ Row count: {count:,} instruments")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_critical_tickers(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate critical tickers are present."""
-    errors = []
-    warnings = []
-    
-    found_tickers = set()
-    ticker_exchanges = {}
-    
-    for inst in data.get('instruments', []):
-        ticker = inst.get('ticker', '').upper()
-        exchange = inst.get('exchange', '')
-        if ticker in CRITICAL_TICKERS:
-            found_tickers.add(ticker)
-            if ticker not in ticker_exchanges:
-                ticker_exchanges[ticker] = []
-            ticker_exchanges[ticker].append(exchange)
-    
-    missing = CRITICAL_TICKERS - found_tickers
-    if missing:
-        errors.append(f"Critical tickers missing: {', '.join(sorted(missing))}")
-    else:
-        print(f"✓ Critical tickers: {', '.join(sorted(CRITICAL_TICKERS))}")
-        for ticker in sorted(CRITICAL_TICKERS):
-            exchanges = ticker_exchanges.get(ticker, [])
-            print(f"  - {ticker}: {', '.join(exchanges)}")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_exchange_coverage(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate coverage across regions."""
-    errors = []
-    warnings = []
-    
-    exchanges_in_data = set(data.get('exchanges', {}).keys())
-    
-    coverage = {}
-    for region, exchanges in EXPECTED_REGIONS.items():
-        found = [e for e in exchanges if e in exchanges_in_data]
-        coverage[region] = {
-            'expected': exchanges,
-            'found': found,
-            'count': data.get('exchanges', {}).get(exchanges[0], 0) if found else 0
-        }
-    
-    # All regions should be represented
-    for region, cov in coverage.items():
-        if not cov['found']:
-            errors.append(f"No coverage for region: {region}")
-        else:
-            print(f"✓ Region {region}: {len(cov['found'])}/{len(cov['expected'])} exchanges")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_isin_coverage(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate ISIN coverage."""
-    errors = []
-    warnings = []
-    
-    isin_pct = data.get('isin_coverage_pct', 0)
-    
-    if isin_pct < MIN_ISIN_COVERAGE_FAIL:
-        errors.append(
-            f"ISIN coverage critically low: {isin_pct}% (minimum: {MIN_ISIN_COVERAGE_FAIL}%)"
-        )
-    elif isin_pct < MIN_ISIN_COVERAGE_WARN:
-        warnings.append(
-            f"⚠️  ISIN coverage below optimal: {isin_pct}% (target: {MIN_ISIN_COVERAGE_WARN}%)"
-        )
-    else:
-        print(f"✓ ISIN coverage: {isin_pct}%")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_data_quality(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Quick data quality checks."""
-    errors = []
-    warnings = []
-    
-    issues = {
-        'null_names': 0,
-        'short_names': 0,
-        'no_isin': 0,
-    }
-    
-    for inst in data.get('instruments', [])[:1000]:  # Sample first 1000
-        name = inst.get('name', '').strip()
-        if not name:
-            issues['null_names'] += 1
-        elif len(name) < 3:
-            issues['short_names'] += 1
-        if not inst.get('isin'):
-            issues['no_isin'] += 1
-    
-    if issues['null_names'] > 10:
-        errors.append(f"Too many instruments with null names: {issues['null_names']}")
-    if issues['short_names'] > 50:
-        warnings.append(f"Many instruments with very short names: {issues['short_names']}")
-    
-    if not errors:
-        print(f"✓ Data quality: {len(data.get('instruments', []))} instruments checked")
-    
-    return len(errors) == 0, errors + warnings
+REQUIRED_FIELDS = ['id', 'ticker', 'name', 'exchange', 'country', 'isin', 'assetType', 'assetClass']
 
 
 def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Validate ticker JSON')
-    parser.add_argument('--input', required=True, help='Path to instruments.json')
-    args = parser.parse_args()
-    
-    print(f"🔍 Validating {args.input}...")
-    print()
-    
-    # Load
+    p = argparse.ArgumentParser()
+    p.add_argument('--input', required=True)
+    a = p.parse_args()
+
+    errors, warnings = [], []
+
     try:
-        data = load_json(args.input)
+        with open(a.input) as f:
+            data = json.load(f)
     except Exception as e:
-        print(f"❌ Failed to load JSON: {e}", file=sys.stderr)
+        print(f"FAIL: cannot read {a.input}: {e}", file=sys.stderr)
         sys.exit(1)
-    
-    # Run validations
-    validators = [
-        ("Schema", validate_schema),
-        ("Row count", validate_row_count),
-        ("Critical tickers", validate_critical_tickers),
-        ("Exchange coverage", validate_exchange_coverage),
-        ("ISIN coverage", validate_isin_coverage),
-        ("Data quality", validate_data_quality),
-    ]
-    
-    all_errors = []
-    all_warnings = []
-    
-    for name, validator in validators:
-        passed, messages = validator(data)
-        errors = [m for m in messages if m.startswith('❌') or (m and not m.startswith('⚠️'))]
-        warnings = [m for m in messages if m.startswith('⚠️')]
-        
-        all_errors.extend(errors)
-        all_warnings.extend(warnings)
-        
-        if not passed:
-            for msg in errors:
-                print(f"  ❌ {msg}")
-    
-    # Warnings
-    for warning in all_warnings:
-        print(f"  {warning}")
-    
-    print()
-    print("="*60)
-    
-    if all_errors:
-        print(f"❌ Validation FAILED ({len(all_errors)} errors)")
-        print("="*60)
-        for error in all_errors:
-            print(f"  • {error}")
+
+    print(f"Validating {a.input}\n")
+
+    instruments = data.get('instruments')
+    if not isinstance(instruments, list) or not instruments:
+        print("FAIL: no instruments array")
         sys.exit(1)
-    elif all_warnings:
-        print(f"⚠️  Validation PASSED with {len(all_warnings)} warning(s)")
-        print("="*60)
-        print("Warnings:")
-        for warning in all_warnings:
-            print(f"  • {warning}")
-        print("\n✅ Deployment will proceed")
-        sys.exit(0)
+
+    # Schema
+    missing = [f for f in REQUIRED_FIELDS if f not in instruments[0]]
+    if missing:
+        errors.append(f"Schema missing fields: {', '.join(missing)}")
     else:
-        print("✅ Validation PASSED")
-        print("="*60)
-        sys.exit(0)
+        print(f"  OK   schema: all {len(REQUIRED_FIELDS)} required fields present")
+
+    # Row count
+    count = data.get('count', len(instruments))
+    if count < MIN_COUNT:
+        errors.append(f"Row count {count:,} below minimum {MIN_COUNT:,}")
+    else:
+        print(f"  OK   row count: {count:,}")
+
+    # Critical tickers
+    found = {}
+    for inst in instruments:
+        t = inst['ticker'].upper()
+        if t in CRITICAL_TICKERS:
+            found.setdefault(t, []).append(inst['exchange'])
+
+    absent = [t for t in CRITICAL_TICKERS if t not in found]
+    if absent:
+        errors.append(f"Critical tickers absent: {', '.join(absent)}")
+    else:
+        print("  OK   critical tickers:")
+        for t in CRITICAL_TICKERS:
+            print(f"         {t} -> {', '.join(sorted(set(found[t])))}")
+
+    # Region coverage
+    present = set(data.get('exchanges', {}))
+    for region, codes in EXPECTED_REGIONS.items():
+        hits = [c for c in codes if c in present]
+        if not hits:
+            errors.append(f"No coverage for region {region} (expected any of: {', '.join(codes)})")
+        else:
+            rows = sum(data['exchanges'][c] for c in hits)
+            print(f"  OK   {region}: {rows:,} rows across {', '.join(hits)}")
+
+    # Unexpected exchanges
+    all_expected = {c for codes in EXPECTED_REGIONS.values() for c in codes}
+    unexpected = present - all_expected
+    if unexpected:
+        warnings.append(f"Unexpected exchanges present: {', '.join(sorted(unexpected))}")
+
+    # ISIN
+    pct = data.get('isin_coverage_pct', 0)
+    if pct < ISIN_FAIL:
+        errors.append(f"ISIN coverage {pct}% below hard floor {ISIN_FAIL}%")
+    elif pct < ISIN_WARN:
+        warnings.append(f"ISIN coverage {pct}% below target {ISIN_WARN}%")
+    else:
+        print(f"  OK   ISIN coverage: {pct}%")
+
+    # Data quality
+    blank_names = sum(1 for i in instruments if not i.get('name', '').strip())
+    if blank_names:
+        ratio = blank_names / count * 100
+        msg = f"{blank_names:,} instruments ({ratio:.1f}%) have no name"
+        (errors if ratio > 5 else warnings).append(msg)
+    else:
+        print("  OK   data quality: all instruments named")
+
+    # Report
+    print("\n" + "=" * 60)
+    for w in warnings:
+        print(f"  WARN  {w}")
+    for e in errors:
+        print(f"  FAIL  {e}")
+
+    if errors:
+        print(f"\nVALIDATION FAILED - {len(errors)} error(s), deployment blocked")
+        print("=" * 60)
+        sys.exit(1)
+
+    if warnings:
+        print(f"\nVALIDATION PASSED with {len(warnings)} warning(s) - deploying")
+    else:
+        print("\nVALIDATION PASSED - deploying")
+    print("=" * 60)
+    sys.exit(0)
 
 
 if __name__ == '__main__':

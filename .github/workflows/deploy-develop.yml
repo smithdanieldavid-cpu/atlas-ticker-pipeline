@@ -8,23 +8,20 @@ on:
 env:
   DEPLOY_ENV: dev
   CLOUDFRONT_DIST_ID: E3202GZ5910KGI
-  S3_BUCKET: data-atlas-dashboard
-  S3_PREFIX: instruments/dev
+  S3_BUCKET: dev-atlas-dashboard
+  S3_KEY: data/instruments.json.gz
 
 jobs:
   refresh-and-deploy:
     name: Transform, Validate, Deploy
     runs-on: ubuntu-latest
-
     permissions:
       contents: read
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -54,47 +51,38 @@ jobs:
         run: python3 scripts/validate.py --input instruments.json
 
       - name: Configure AWS credentials
-        if: success()
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ap-southeast-2
 
-      - name: Upload tickers to S3
+      - name: Upload to S3
         run: |
           aws s3 cp instruments.json.gz \
-            s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.json.gz \
+            s3://${{ env.S3_BUCKET }}/${{ env.S3_KEY }} \
             --content-type application/json \
             --content-encoding gzip \
-            --cache-control "max-age=604800"
+            --cache-control "max-age=86400"
 
-      - name: Upload dated snapshot
-        run: |
-          STAMP=$(date -u +"%Y-%m-%d")
-          aws s3 cp instruments.json.gz \
-            s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest-${STAMP}.json.gz \
-            --content-type application/json \
-            --content-encoding gzip
-
-      - name: Invalidate CloudFront cache
+      - name: Invalidate CloudFront
         run: |
           aws cloudfront create-invalidation \
             --distribution-id ${{ env.CLOUDFRONT_DIST_ID }} \
-            --paths "/${{ env.S3_PREFIX }}/*"
+            --paths "/${{ env.S3_KEY }}"
 
-      - name: Log summary
+      - name: Summary
         if: always()
         run: |
-          echo "════════════════════════════════════════"
+          echo "===================================="
           echo "Deploy Summary (${{ env.DEPLOY_ENV }})"
-          echo "════════════════════════════════════════"
-          echo "S3: s3://${{ env.S3_BUCKET }}/${{ env.S3_PREFIX }}/latest.json.gz"
+          echo "===================================="
+          echo "s3://${{ env.S3_BUCKET }}/${{ env.S3_KEY }}"
           if [ -f instruments.json ]; then
             echo "Instruments:   $(jq -r '.count' instruments.json)"
             echo "ISIN coverage: $(jq -r '.isin_coverage_pct' instruments.json)%"
             echo "Exchanges:     $(jq -r '.exchanges | keys | join(", ")' instruments.json)"
           else
-            echo "No instruments.json produced — transform did not complete."
+            echo "No output produced - transform did not complete."
           fi
-          echo "════════════════════════════════════════"
+          echo "===================================="

@@ -1,215 +1,158 @@
 #!/usr/bin/env python3
 """
-Transform free-ticker-database SQLite → normalized JSON for Atlas ticker search.
+Transform free-ticker-database SQLite -> normalized JSON for Atlas ticker search.
+
+Reads the `listings` table (venue-level, one row per listing_key) rather than
+`tickers` (one globally-unique row per symbol). This matters for cross-listings:
+BHP exists as both ASX::BHP (ISIN AU000000BHP4) and NYSE::BHP (ISIN
+US0886061086), and an ASX holder must be offered the ASX line.
 
 Usage:
   python3 scripts/transform_tickers.py \
     --input /path/to/free-ticker-database/data/tickers.db \
     --output instruments.json
-
-Output: instruments.json (uncompressed for validation)
-        instruments.json.gz (gzipped for S3)
 """
 
 import sqlite3
 import json
 import gzip
 import sys
-from datetime import datetime
+import argparse
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Any
 
 
-# Target markets: USA, Australia, Asia (JP/HK/SG/KR/VN), Canada
-TARGET_EXCHANGES = {
-    # USA
-    'NASDAQ',
-    'NYSE',
-    
-    # Australia
-    'ASX',
-    
-    # Asia
-    'JPX',      # Japan
-    'HKEX',     # Hong Kong
-    'SGX',      # Singapore
-    'KRX',      # South Korea
-    'HOSE',     # Vietnam (Hanoi)
-    'HNX',      # Vietnam (Hanoi)
-    'UPCOM',    # Vietnam (UpCom)
-    
-    # Canada
-    'TMX',
+# Exchange codes exactly as they appear upstream. Verified against the dataset -
+# do not guess. JPX/TMX do NOT exist here; Japan is TSE, Canada is TSX/TSXV/NEO.
+EXCHANGES_BY_REGION = {
+    'US': ['NASDAQ', 'NYSE', 'NYSE ARCA', 'NYSE MKT', 'BATS'],
+    'AU': ['ASX'],
+    'ASIA': ['TSE', 'HKEX', 'SGX', 'KRX', 'KOSDAQ', 'HOSE', 'HNX', 'UPCOM'],
+    'CANADA': ['TSX', 'TSXV', 'NEO'],
 }
 
-# Critical tickers (must be present for deployment)
-CRITICAL_TICKERS = {
-    'NVDA',     # US
-    'BHP',      # AU
-    'PMGOLD',   # AU
-    'VGAD',     # AU
-    'VGS',      # AU
+TARGET_EXCHANGES = sorted({e for v in EXCHANGES_BY_REGION.values() for e in v})
+
+# Exchange -> Atlas asset_class, for prefilling the holdings dropdown.
+# Keyed on exchange, NOT country: upstream `country` is the issuer's domicile,
+# so NYSE::BHP reports "Australia" and would mis-prefill as au_equities.
+ASSET_CLASS_BY_EXCHANGE = {
+    'NASDAQ': 'us_equities',
+    'NYSE': 'us_equities',
+    'NYSE ARCA': 'us_equities',
+    'NYSE MKT': 'us_equities',
+    'BATS': 'us_equities',
+    'ASX': 'au_equities',
 }
 
 
-def transform_tickers(input_db: str, output_json: str) -> Dict[str, Any]:
-    """
-    Transform SQLite database → normalized JSON.
-    
-    Returns validation metadata.
-    """
-    
-    print(f"📖 Opening database: {input_db}")
+def transform(input_db, output_json):
+    print(f"Opening {input_db}")
     conn = sqlite3.connect(input_db)
     conn.row_factory = sqlite3.Row
-    cursor = conn.cursor()
-    
-    # Fetch tickers for target exchanges
-    print(f"🔍 Filtering to {len(TARGET_EXCHANGES)} target exchanges...")
-    placeholders = ','.join(['?' for _ in TARGET_EXCHANGES])
-    
-    cursor.execute(f"""
-        SELECT 
-            ticker,
-            name,
-            exchange,
-            country,
-            country_code,
-            isin,
-            asset_type,
-            stock_sector,
-            etf_category
-        FROM tickers
+    cur = conn.cursor()
+
+    placeholders = ','.join('?' for _ in TARGET_EXCHANGES)
+    cur.execute(f"""
+        SELECT listing_key, ticker, exchange, name, asset_type,
+               stock_sector, etf_category, country, country_code, isin
+        FROM listings
         WHERE exchange IN ({placeholders})
         ORDER BY exchange, ticker
-    """, list(TARGET_EXCHANGES))
-    
-    rows = cursor.fetchall()
-    print(f"✓ Fetched {len(rows)} rows from target exchanges")
-    
-    # Transform
+    """, TARGET_EXCHANGES)
+
+    rows = cur.fetchall()
+    conn.close()
+    print(f"Fetched {len(rows):,} venue-level listings across {len(TARGET_EXCHANGES)} exchanges")
+
     instruments = []
     isin_count = 0
     exchange_counts = {}
-    
-    for row in rows:
-        ticker = row['ticker']
-        name = row['name'] or ''
-        exchange = row['exchange']
-        country = row['country'] or row['country_code'] or 'UNKNOWN'
-        isin = row['isin'] or ''
-        asset_type = row['asset_type'] or 'Unknown'
-        sector = row['stock_sector'] or ''
-        category = row['etf_category'] or ''
-        
-        # Composite key: TICKER-EXCHANGE-COUNTRY
-        composite_id = f"{ticker}-{exchange}-{country}".upper()
-        
-        # Track exchange counts
+    seen_keys = set()
+
+    for r in rows:
+        listing_key = (r['listing_key'] or '').strip()
+        ticker = (r['ticker'] or '').strip()
+        exchange = (r['exchange'] or '').strip()
+
+        if not listing_key or not ticker or not exchange:
+            continue
+        if listing_key in seen_keys:
+            continue
+        seen_keys.add(listing_key)
+
+        isin = (r['isin'] or '').strip()
+        asset_type = (r['asset_type'] or '').strip()
+
         exchange_counts[exchange] = exchange_counts.get(exchange, 0) + 1
-        
-        # Track ISIN coverage
         if isin:
             isin_count += 1
-        
-        # Determine asset type category (for frontend filtering)
-        if asset_type == 'Stock':
-            asset_category = 'Equity'
-        elif asset_type == 'ETF':
-            asset_category = 'ETF'
-        elif asset_type == 'Index':
-            asset_category = 'Index'
-        else:
-            asset_category = 'Other'
-        
+
         instruments.append({
-            'id': composite_id,
+            'id': listing_key,
             'ticker': ticker,
-            'name': name,
+            'name': (r['name'] or '').strip(),
             'exchange': exchange,
-            'country': country,
+            'country': (r['country'] or '').strip(),
+            'countryCode': (r['country_code'] or '').strip(),
             'isin': isin,
-            'assetType': asset_category,
-            'sector': sector if asset_type == 'Stock' else '',
-            'category': category if asset_type == 'ETF' else '',
+            'assetType': (
+                'ETF' if asset_type == 'ETF'
+                else 'Equity' if asset_type == 'Stock'
+                else (asset_type or 'Other')
+            ),
+            'assetClass': ASSET_CLASS_BY_EXCHANGE.get(exchange, 'global_equities'),
+            'sector': (r['stock_sector'] or '').strip(),
+            'category': (r['etf_category'] or '').strip(),
         })
-    
-    conn.close()
-    
-    # Build output
+
+    total = len(instruments)
+    if not total:
+        raise RuntimeError("No instruments matched the target exchanges - check exchange codes")
+
     output = {
-        'version': '1.0',
-        'timestamp': datetime.utcnow().isoformat() + 'Z',
-        'source': 'free-ticker-database (adanos-software)',
+        'version': '2.0',
+        'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'),
+        'source': 'free-ticker-database (adanos-software, MIT)',
         'source_url': 'https://github.com/adanos-software/free-ticker-database',
-        'count': len(instruments),
+        'source_table': 'listings',
+        'count': total,
         'isin_coverage': isin_count,
-        'isin_coverage_pct': round(isin_count / len(instruments) * 100, 1) if instruments else 0,
-        'exchanges': exchange_counts,
+        'isin_coverage_pct': round(isin_count / total * 100, 1),
+        'exchanges': dict(sorted(exchange_counts.items())),
         'instruments': instruments,
     }
-    
-    # Write uncompressed JSON (for validation)
-    print(f"✍️  Writing {output_json}...")
+
     with open(output_json, 'w') as f:
-        json.dump(output, f, indent=2)
-    
-    json_size = Path(output_json).stat().st_size
-    print(f"✓ Wrote {json_size:,} bytes")
-    
-    # Write gzipped JSON (for S3)
+        json.dump(output, f, separators=(',', ':'))
+    raw = Path(output_json).stat().st_size
+
     gz_path = output_json.replace('.json', '.json.gz')
-    print(f"📦 Compressing to {gz_path}...")
-    with open(output_json, 'rb') as f_in:
-        with gzip.open(gz_path, 'wb') as f_out:
-            f_out.write(f_in.read())
-    
-    gz_size = Path(gz_path).stat().st_size
-    print(f"✓ Compressed to {gz_size:,} bytes ({100*gz_size/json_size:.1f}% of original)")
-    
+    with open(output_json, 'rb') as fin, gzip.open(gz_path, 'wb', compresslevel=9) as fout:
+        fout.write(fin.read())
+    gz = Path(gz_path).stat().st_size
+
+    print(f"Wrote {output_json} ({raw:,} bytes)")
+    print(f"Wrote {gz_path} ({gz:,} bytes, {100*gz/raw:.1f}%)")
+    print()
+    print(f"Instruments:   {total:,}")
+    print(f"ISIN coverage: {output['isin_coverage_pct']}%")
+    print(f"Exchanges:     {', '.join(output['exchanges'])}")
     return output
 
 
-def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(
-        description='Transform free-ticker-database SQLite → Atlas JSON'
-    )
-    parser.add_argument(
-        '--input',
-        required=True,
-        help='Path to tickers.db (from free-ticker-database)'
-    )
-    parser.add_argument(
-        '--output',
-        default='instruments.json',
-        help='Output JSON path (default: instruments.json)'
-    )
-    
-    args = parser.parse_args()
-    
-    # Validate input
-    if not Path(args.input).exists():
-        print(f"❌ Error: {args.input} not found")
-        sys.exit(1)
-    
-    try:
-        metadata = transform_tickers(args.input, args.output)
-        
-        print("\n" + "="*60)
-        print("✅ Transform complete")
-        print("="*60)
-        print(f"Total instruments: {metadata['count']:,}")
-        print(f"ISIN coverage: {metadata['isin_coverage_pct']}%")
-        print(f"Exchanges: {len(metadata['exchanges'])}")
-        print(f"Output: {args.output}")
-        print(f"Output (gzip): {args.output.replace('.json', '.json.gz')}")
-        
-    except Exception as e:
-        print(f"❌ Error: {e}", file=sys.stderr)
-        sys.exit(1)
-
-
 if __name__ == '__main__':
-    main()
+    p = argparse.ArgumentParser()
+    p.add_argument('--input', required=True)
+    p.add_argument('--output', default='instruments.json')
+    a = p.parse_args()
+
+    if not Path(a.input).exists():
+        print(f"ERROR: {a.input} not found", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        transform(a.input, a.output)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
