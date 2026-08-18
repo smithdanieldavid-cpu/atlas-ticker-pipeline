@@ -7,7 +7,7 @@ on:
 
 env:
   DEPLOY_ENV: dev
-  CLOUDFRONT_DIST_ID: E3202GZ5910KGI
+  CLOUDFRONT_DIST_ID: E3202GZS910KGI
   S3_BUCKET: dev-atlas-dashboard
   S3_KEY: data/instruments.json.gz
 
