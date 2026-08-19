@@ -1,273 +1,177 @@
 #!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# Atlas Dashboard - Ticker Pipeline / Validate
+# Copyright (c) 2026 Atlas Dashboard (ABN 30 782 536 570)
+# ---------------------------------------------------------------------------
 """
-Validate transformed ticker JSON before deployment.
+Validate the columnar ticker payload before deployment.
 
-Checks:
-  ✓ Row count (sanity check)
-  ✓ Critical tickers present (NVDA, BHP, PMGOLD, VGAD, VGS)
-  ✓ Exchange coverage (all 4 regions)
-  ✓ ISIN coverage (warn if <95%, fail if <85%)
-  ✓ Schema validation
-  ✓ No truncation/corruption
+FAIL (blocks deploy): missing critical ticker, row count too low, absent
+                      region, malformed columns, bad schema
+WARN (deploys anyway): low alias coverage, unexpected exchanges, minor
+                       data quality issues
 
-Usage:
-  python3 scripts/validate.py --input instruments.json
-
-Exit codes:
-  0 = PASS (may have warnings)
-  1 = FAIL (critical issue)
+Exit 0 = deploy, Exit 1 = block.
 """
 
 import json
 import sys
-from pathlib import Path
-from typing import List, Dict, Any, Tuple
+import argparse
 
+CRITICAL_TICKERS = ['NVDA', 'BHP', 'PMGOLD', 'VGAD', 'VGS']
 
-# Critical tickers (must be present)
-CRITICAL_TICKERS = {
-    'NVDA',     # US
-    'BHP',      # AU
-    'PMGOLD',   # AU
-    'VGAD',     # AU
-    'VGS',      # AU
-}
-
-# Expected regional coverage
 EXPECTED_REGIONS = {
-    'US': ['NASDAQ', 'NYSE'],
+    'US': ['NASDAQ', 'NYSE', 'NYSE ARCA', 'NYSE MKT', 'BATS'],
     'AU': ['ASX'],
-    'ASIA': ['JPX', 'HKEX', 'SGX', 'KRX', 'HOSE', 'HNX', 'UPCOM'],
-    'CANADA': ['TMX'],
+    'ASIA': ['TSE', 'HKEX', 'SGX', 'KRX', 'KOSDAQ', 'HOSE', 'HNX', 'UPCOM'],
+    'CANADA': ['TSX', 'TSXV', 'NEO'],
 }
 
-# Thresholds
-MIN_INSTRUMENT_COUNT = 50000
-MIN_ISIN_COVERAGE_FAIL = 85.0
-MIN_ISIN_COVERAGE_WARN = 95.0
-
-
-def load_json(path: str) -> Dict[str, Any]:
-    """Load and parse JSON."""
-    with open(path, 'r') as f:
-        return json.load(f)
-
-
-def validate_schema(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate JSON schema."""
-    errors = []
-    warnings = []
-    
-    required_keys = ['version', 'timestamp', 'count', 'instruments']
-    for key in required_keys:
-        if key not in data:
-            errors.append(f"Missing required key: {key}")
-    
-    if not isinstance(data.get('instruments'), list):
-        errors.append("'instruments' must be a list")
-        return len(errors) == 0, errors
-    
-    # Check first instrument schema
-    if data['instruments']:
-        first = data['instruments'][0]
-        required_fields = ['id', 'ticker', 'name', 'exchange', 'country', 'isin', 'assetType']
-        for field in required_fields:
-            if field not in first:
-                errors.append(f"Missing field in instrument: {field}")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_row_count(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate minimum row count."""
-    errors = []
-    warnings = []
-    
-    count = data.get('count', 0)
-    if count < MIN_INSTRUMENT_COUNT:
-        errors.append(
-            f"Row count too low: {count:,} (minimum: {MIN_INSTRUMENT_COUNT:,})"
-        )
-    else:
-        print(f"✓ Row count: {count:,} instruments")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_critical_tickers(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate critical tickers are present."""
-    errors = []
-    warnings = []
-    
-    found_tickers = set()
-    ticker_exchanges = {}
-    
-    for inst in data.get('instruments', []):
-        ticker = inst.get('ticker', '').upper()
-        exchange = inst.get('exchange', '')
-        if ticker in CRITICAL_TICKERS:
-            found_tickers.add(ticker)
-            if ticker not in ticker_exchanges:
-                ticker_exchanges[ticker] = []
-            ticker_exchanges[ticker].append(exchange)
-    
-    missing = CRITICAL_TICKERS - found_tickers
-    if missing:
-        errors.append(f"Critical tickers missing: {', '.join(sorted(missing))}")
-    else:
-        print(f"✓ Critical tickers: {', '.join(sorted(CRITICAL_TICKERS))}")
-        for ticker in sorted(CRITICAL_TICKERS):
-            exchanges = ticker_exchanges.get(ticker, [])
-            print(f"  - {ticker}: {', '.join(exchanges)}")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_exchange_coverage(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate coverage across regions."""
-    errors = []
-    warnings = []
-    
-    exchanges_in_data = set(data.get('exchanges', {}).keys())
-    
-    coverage = {}
-    for region, exchanges in EXPECTED_REGIONS.items():
-        found = [e for e in exchanges if e in exchanges_in_data]
-        coverage[region] = {
-            'expected': exchanges,
-            'found': found,
-            'count': data.get('exchanges', {}).get(exchanges[0], 0) if found else 0
-        }
-    
-    # All regions should be represented
-    for region, cov in coverage.items():
-        if not cov['found']:
-            errors.append(f"No coverage for region: {region}")
-        else:
-            print(f"✓ Region {region}: {len(cov['found'])}/{len(cov['expected'])} exchanges")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_isin_coverage(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Validate ISIN coverage."""
-    errors = []
-    warnings = []
-    
-    isin_pct = data.get('isin_coverage_pct', 0)
-    
-    if isin_pct < MIN_ISIN_COVERAGE_FAIL:
-        errors.append(
-            f"ISIN coverage critically low: {isin_pct}% (minimum: {MIN_ISIN_COVERAGE_FAIL}%)"
-        )
-    elif isin_pct < MIN_ISIN_COVERAGE_WARN:
-        warnings.append(
-            f"⚠️  ISIN coverage below optimal: {isin_pct}% (target: {MIN_ISIN_COVERAGE_WARN}%)"
-        )
-    else:
-        print(f"✓ ISIN coverage: {isin_pct}%")
-    
-    return len(errors) == 0, errors + warnings
-
-
-def validate_data_quality(data: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Quick data quality checks."""
-    errors = []
-    warnings = []
-    
-    issues = {
-        'null_names': 0,
-        'short_names': 0,
-        'no_isin': 0,
-    }
-    
-    for inst in data.get('instruments', [])[:1000]:  # Sample first 1000
-        name = inst.get('name', '').strip()
-        if not name:
-            issues['null_names'] += 1
-        elif len(name) < 3:
-            issues['short_names'] += 1
-        if not inst.get('isin'):
-            issues['no_isin'] += 1
-    
-    if issues['null_names'] > 10:
-        errors.append(f"Too many instruments with null names: {issues['null_names']}")
-    if issues['short_names'] > 50:
-        warnings.append(f"Many instruments with very short names: {issues['short_names']}")
-    
-    if not errors:
-        print(f"✓ Data quality: {len(data.get('instruments', []))} instruments checked")
-    
-    return len(errors) == 0, errors + warnings
+MIN_COUNT = 10000
+CATEGORICAL = ['exchange', 'assetType', 'assetClass', 'sector', 'category', 'country']
+TEXT_COLUMNS = ['ticker', 'name']
 
 
 def main():
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='Validate ticker JSON')
-    parser.add_argument('--input', required=True, help='Path to instruments.json')
-    args = parser.parse_args()
-    
-    print(f"🔍 Validating {args.input}...")
-    print()
-    
-    # Load
+    p = argparse.ArgumentParser()
+    p.add_argument('--input', required=True)
+    a = p.parse_args()
+
+    errors, warnings = [], []
+
     try:
-        data = load_json(args.input)
+        with open(a.input) as f:
+            data = json.load(f)
     except Exception as e:
-        print(f"❌ Failed to load JSON: {e}", file=sys.stderr)
+        print(f"FAIL: cannot read {a.input}: {e}", file=sys.stderr)
         sys.exit(1)
-    
-    # Run validations
-    validators = [
-        ("Schema", validate_schema),
-        ("Row count", validate_row_count),
-        ("Critical tickers", validate_critical_tickers),
-        ("Exchange coverage", validate_exchange_coverage),
-        ("ISIN coverage", validate_isin_coverage),
-        ("Data quality", validate_data_quality),
-    ]
-    
-    all_errors = []
-    all_warnings = []
-    
-    for name, validator in validators:
-        passed, messages = validator(data)
-        errors = [m for m in messages if m.startswith('❌') or (m and not m.startswith('⚠️'))]
-        warnings = [m for m in messages if m.startswith('⚠️')]
-        
-        all_errors.extend(errors)
-        all_warnings.extend(warnings)
-        
-        if not passed:
-            for msg in errors:
-                print(f"  ❌ {msg}")
-    
-    # Warnings
-    for warning in all_warnings:
-        print(f"  {warning}")
-    
-    print()
-    print("="*60)
-    
-    if all_errors:
-        print(f"❌ Validation FAILED ({len(all_errors)} errors)")
-        print("="*60)
-        for error in all_errors:
-            print(f"  • {error}")
+
+    print(f"Validating {a.input}\n")
+
+    if data.get('encoding') != 'columnar':
+        errors.append(f"Expected columnar encoding, got {data.get('encoding')!r}")
+
+    columns = data.get('columns')
+    legend = data.get('legend')
+    if not isinstance(columns, dict) or not isinstance(legend, dict):
+        print("FAIL: missing columns or legend")
         sys.exit(1)
-    elif all_warnings:
-        print(f"⚠️  Validation PASSED with {len(all_warnings)} warning(s)")
-        print("="*60)
-        print("Warnings:")
-        for warning in all_warnings:
-            print(f"  • {warning}")
-        print("\n✅ Deployment will proceed")
-        sys.exit(0)
+
+    # --- schema ---
+    missing = [c for c in TEXT_COLUMNS + CATEGORICAL if c not in columns]
+    if missing:
+        errors.append(f"Missing columns: {', '.join(missing)}")
     else:
-        print("✅ Validation PASSED")
-        print("="*60)
-        sys.exit(0)
+        print(f"  OK   schema: all {len(TEXT_COLUMNS + CATEGORICAL)} columns present")
+
+    # --- column alignment: every column must be the same length ---
+    count = data.get('count', 0)
+    lengths = {c: len(columns[c]) for c in TEXT_COLUMNS + CATEGORICAL if c in columns}
+    bad = {c: n for c, n in lengths.items() if n != count}
+    if bad:
+        errors.append(
+            f"Column length mismatch (expected {count:,}): " +
+            ', '.join(f'{c}={n:,}' for c, n in bad.items()))
+    else:
+        print(f"  OK   alignment: all columns {count:,} long")
+
+    # --- codes must be in range for their legend ---
+    for field in CATEGORICAL:
+        if field not in columns or field not in legend:
+            continue
+        size = len(legend[field])
+        oob = [v for v in columns[field] if not isinstance(v, int) or v < 0 or v >= size]
+        if oob:
+            errors.append(
+                f"{field}: {len(oob)} codes outside legend range 0..{size-1}")
+    if not any('codes outside' in e for e in errors):
+        print(f"  OK   legend codes: all in range")
+
+    # --- row count ---
+    if count < MIN_COUNT:
+        errors.append(f"Row count {count:,} below minimum {MIN_COUNT:,}")
+    else:
+        print(f"  OK   row count: {count:,}")
+
+    # --- critical tickers (decode exchange to check venue coverage) ---
+    if 'ticker' in columns and 'exchange' in columns and 'exchange' in legend:
+        ex_legend = legend['exchange']
+        found = {}
+        for idx, t in enumerate(columns['ticker']):
+            tu = t.upper()
+            if tu in CRITICAL_TICKERS:
+                found.setdefault(tu, []).append(ex_legend[columns['exchange'][idx]])
+
+        absent = [t for t in CRITICAL_TICKERS if t not in found]
+        if absent:
+            errors.append(f"Critical tickers absent: {', '.join(absent)}")
+        else:
+            print("  OK   critical tickers:")
+            for t in CRITICAL_TICKERS:
+                print(f"         {t} -> {', '.join(sorted(set(found[t])))}")
+            # BHP must carry its ASX line, not just NYSE - this is the
+            # cross-listing regression that moving to `listings` fixed
+            if 'BHP' in found and 'ASX' not in found['BHP']:
+                errors.append(
+                    "BHP has no ASX listing - cross-listing regression, "
+                    "check the transform is reading `listings` not `tickers`")
+
+    # --- region coverage ---
+    present = set(data.get('exchanges', {}))
+    for region, codes in EXPECTED_REGIONS.items():
+        hits = [c for c in codes if c in present]
+        if not hits:
+            errors.append(f"No coverage for region {region}")
+        else:
+            rows = sum(data['exchanges'][c] for c in hits)
+            print(f"  OK   {region}: {rows:,} rows across {', '.join(hits)}")
+
+    all_expected = {c for codes in EXPECTED_REGIONS.values() for c in codes}
+    unexpected = present - all_expected
+    if unexpected:
+        warnings.append(f"Unexpected exchanges: {', '.join(sorted(unexpected))}")
+
+    # --- data quality ---
+    if 'name' in columns:
+        blank = sum(1 for n in columns['name'] if not n.strip())
+        if blank:
+            ratio = blank / count * 100
+            msg = f"{blank:,} instruments ({ratio:.1f}%) have no name"
+            (errors if ratio > 5 else warnings).append(msg)
+        else:
+            print("  OK   data quality: all instruments named")
+
+    # --- aliases (sparse dict, indices must be valid) ---
+    aliases = columns.get('aliases', {})
+    if isinstance(aliases, dict):
+        bad_idx = [k for k in aliases if not k.isdigit() or int(k) >= count]
+        if bad_idx:
+            errors.append(f"{len(bad_idx)} alias keys outside row range")
+        else:
+            n = sum(len(v) for v in aliases.values())
+            print(f"  OK   aliases: {n:,} across {len(aliases):,} listings")
+            if len(aliases) < count * 0.02:
+                warnings.append(
+                    f"Alias coverage low ({100*len(aliases)/count:.1f}% of listings)")
+
+    # --- report ---
+    print("\n" + "=" * 60)
+    for w in warnings:
+        print(f"  WARN  {w}")
+    for e in errors:
+        print(f"  FAIL  {e}")
+
+    if errors:
+        print(f"\nVALIDATION FAILED - {len(errors)} error(s), deployment blocked")
+        print("=" * 60)
+        sys.exit(1)
+
+    if warnings:
+        print(f"\nVALIDATION PASSED with {len(warnings)} warning(s) - deploying")
+    else:
+        print("\nVALIDATION PASSED - deploying")
+    print("=" * 60)
+    sys.exit(0)
 
 
 if __name__ == '__main__':

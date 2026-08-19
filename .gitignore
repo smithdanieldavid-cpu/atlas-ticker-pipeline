@@ -4,3 +4,5 @@ instruments.json.gz
 __pycache__/
 *.pyc
 .DS_Store
+instruments-full.json*
+instruments-full.json*
