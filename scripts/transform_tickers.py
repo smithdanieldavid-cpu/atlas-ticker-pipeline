@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# Atlas Dashboard - Ticker Pipeline / Transform
+# Copyright (c) 2026 Atlas Dashboard (ABN 30 782 536 570)
+# ---------------------------------------------------------------------------
 """
 Transform free-ticker-database SQLite -> columnar JSON for Atlas ticker search.
 

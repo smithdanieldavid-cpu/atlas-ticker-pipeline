@@ -1,4 +1,8 @@
 #!/usr/bin/env python3
+# ---------------------------------------------------------------------------
+# Atlas Dashboard - Ticker Pipeline / Validate
+# Copyright (c) 2026 Atlas Dashboard (ABN 30 782 536 570)
+# ---------------------------------------------------------------------------
 """
 Validate the columnar ticker payload before deployment.
 
